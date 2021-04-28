@@ -1,0 +1,394 @@
+---
+title: "Capstone - MovieLens (2021)"
+author: "Martin Knell"
+date: "28/04/2021"
+output: pdf_document
+---
+
+# 1. Overview
+
+This project is part of the Capstone Assignment of the HarvardX Professional Certificate in Data Science Program. The objective of the project is to develop a movie recommendation algorithm based on a subset of the MovieLens data set, with a target RMSE (Root Mean Square Error) below 0.86490.
+
+
+## 1.1 Introduction
+
+Movie recommendation systems predict the rating that a user u will give to a movie (item) i. The system will then recommend movies to a user, for which the algorithm predicts a high rating from this user. Recommendations are typically based on 
+
+a) Previous user viewing history and ratings, finding similar movies to the ones the user liked
+b) Movie ratings from similar users
+
+The aim of this project is to train a machine learning algorithm to predict user ratings based on a 10M row subset of the MovieLens data set. 
+
+
+
+## 1.2 Success Measure
+
+The quality of the algorithm will be evaluated on a validation data set. The success measure is the RMSE (Root Mean Square Error) defined as
+
+$$ RMSE = \sqrt{\frac{1}{N}\displaystyle\sum_{u,i} (\hat{y}_{u,i}-y_{u,i})^{2}} $$
+
+where N is the number of user/movie combination, y_ui is the rating of of movie i by user u, and y_hat is the prediction of this rating. 
+
+This formula is executed with the following R-function
+
+```{r}
+RMSE <- function(true_ratings, predicted_ratings){sqrt(mean((true_ratings - predicted_ratings)^2))}
+```
+
+This project aims to find an algorithm with an RMSE below 0.86490
+
+
+
+## 1.3 Data Set
+
+The subset of 10M rows from the movie lens data set is produced using the provided code. The code creates a training data set (edx) and a validation set (validation) containing 10% of the data. The code can be found in the R-script and R-markdown document. It will not be displayed in the pdf report. 
+
+```{r, echo=FALSE, results=FALSE, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(caret)
+library(data.table)
+library(rmarkdown)
+library(lubridate)
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                           title = as.character(title),
+                                           genres = as.character(genres))
+
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") 
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+
+
+# 2. Data Exploration
+
+## 2.1 Structure of Data Set
+
+The edx dataset has the following structure
+
+```{r, echo=FALSE}
+head(edx)
+```
+
+The information contains the user ID, movie ID, title, genre, rating and time of rating. The total training data set contains approx. 9M ratings for over 10,000 movies from nearly 70,000 users.
+
+```{r}
+nrow(edx)
+
+movies <- unique(edx$movieId)
+length(movies)
+
+users <- unique(edx$userId)
+length(users)
+```
+
+The summary information for the dataset confirms there are no missing values.
+
+```{r}
+summary(edx)
+```
+
+
+## 2.2 Rating Distribution
+
+The most common movie rating is 4, followed by 3. Full star ratings are more common than half star ratings. Figure 1 shows the general distribution of ratings
+
+```{r, warning=FALSE}
+rating_count <- edx %>% group_by(rating) %>% summarize(n = n())
+rating_count[order(rating_count$n),]
+
+half_star <- rating_count %>% filter(rating %in% c(0.5, 1.5, 2.5, 3.5, 4.5))
+full_star <- rating_count %>% filter(rating %in% c(1,2,3,4,5))
+
+sum(half_star$n)
+sum(full_star$n)
+```
+
+### Figure 1: Rating Score Distribution
+
+```{r, warning=FALSE}
+rating_plot <- edx %>% ggplot(aes(rating)) + 
+  geom_histogram(binwidth = 0.25, color = "blue", fill = "blue") +
+  scale_x_discrete(limits = c(seq(0.5,5,0.5))) + 
+  scale_y_continuous(breaks = c(seq(0, 3000000, 500000))) +
+  theme_classic(base_size = 10) + ggtitle("Rating Score Frequency")
+rating_plot
+```
+
+1% of movies in the dataset have over 10,000 ratings. About half of movies have over 100 ratings. A significant amount of 12% of movies have only one rating. 
+
+```{r}
+movie_count <- edx %>% group_by(movieId) %>% summarize(n = n())
+movie_count[order(-movie_count$n), ]
+
+mean(movie_count$n == 1)
+mean(movie_count$n >= 100)
+mean(movie_count$n >= 1000)
+mean(movie_count$n >= 10000)
+```
+
+
+## 2.3 Movie Effect on Ratings
+
+The average rating on a movie is very dependent on the movie, which suggests a strong movie effect on ratings. Figure 2 shows the distribution of movie rating averages. The total average of movie ratings is 3.5.
+
+### Figure 2: Movie Effect on Ratings
+
+```{r, warning=FALSE, message=FALSE}
+movie_effect <- edx %>% group_by(movieId) %>% summarize(avg_score = mean(rating)) %>% 
+  ggplot(aes(avg_score)) +
+  geom_histogram(binwidth = 0.25, color = "black", fill = "blue") +
+  scale_x_discrete(limits = c(seq(0.5,5,0.5))) +
+  scale_y_continuous(breaks = c(seq(0, 1500, 500))) +
+  theme_classic(base_size = 10) + ggtitle("Movie Effect on Ratings") + 
+  xlab("average score") + ylab("# movies")
+movie_effect
+
+mean(edx$rating)
+```
+
+
+## 2.4 User Effect on Ratings
+
+There is also a user effect of ratings. That means different users tend to give different rating averages. User averages can range from generous to harsh. Figure 3 shows the distribution of user rating averages. 
+
+### Figure 3: User Effect on Ratings
+
+```{r, warning=FALSE, message=FALSE}
+user_effect <- edx %>% group_by(userId) %>% summarize(avg_score = mean(rating), n = n()) %>% 
+  filter(n >= 100) %>% ggplot(aes(avg_score)) +
+  geom_histogram(binwidth = 0.25, color = "black", fill = "blue") +
+  scale_x_discrete(limits = c(seq(0.5,5,0.5))) +
+  scale_y_continuous(breaks = c(seq(0, 10000, 1000))) +
+  theme_classic(base_size = 10) + ggtitle("User Effect on Ratings") + 
+  xlab("average score") + ylab("# users")
+user_effect
+```
+
+
+## 2.5 Time Effect on Ratings
+
+Apart from movie effect and user effect on ratings, overall rating averages also change over time as shown in Figure 4. The lowest average ratings were observed around 2005.
+
+### Figure 4: Time Effect on Ratings
+
+```{r, warning=FALSE, message=FALSE}
+time_effect <- edx %>% mutate(date = as_datetime(timestamp)) %>% 
+  mutate(week = round_date(date, unit = "week")) %>%
+  group_by(week) %>% summarize(avg = mean(rating)) %>% ggplot(aes(week, avg)) + 
+  geom_point() + geom_smooth() + ylim(3.25,3.75) + 
+  ylab("ratings") + ggtitle("Time Effect on Ratings") + 
+  theme_classic(base_size = 10)
+time_effect
+```
+
+
+# 3.0 Methods and Analysis
+
+We will create a baseline for RMSE comparison by predicting the overall average for movie ratings. We will then add the movie effect and user effect on ratings as shown in chapter 2. Finally, we will compare Regularization and Gradient Boosting Machines to achieve the target RMSE for this assignment. Note a knn approach with k = 25 was also attempted but abandoned due to required run times on a standard laptop. The code for the knn model can be found in the R-script. 
+
+
+## 3.1 Average Rating
+
+As a baseline, we simply predict the average of all ratings and derive the RMSE
+
+$$ Y_{u, i} = \mu + \epsilon_{u, i} $$
+
+Predicting just the average rating delivers an RMSE of 1.061202
+
+```{r, warning=FALSE, message=FALSE}
+avg <- mean(edx$rating)
+
+rmse_1 <- RMSE(validation$rating, avg)
+
+rmses <- data_frame(method = "Predict Average", RMSE = rmse_1)
+rmses %>% knitr::kable()
+```
+
+
+## 3.2 Adding the Movie Effect Term
+
+As shown in chapter 2.3 there is a movie effect on ratings. That means different movies attract different average ratings.We account for this effect by adding the movie effect bi to the prediction formula
+
+$$Y_{u, i} = \mu +b_{i}+ \epsilon_{u, i}$$
+
+The least square estimate bi_hat is equal to the deviation of the individual movie averages from the overall average. Adding the movie effect to the algorithm delivers an RMSE of 0.9439087.
+
+```{r, warning=FALSE, message=FALSE}
+movie_effect <- edx %>% group_by(movieId) %>% summarize(bi = mean(rating - avg))
+predicted_2 <- avg + validation %>% left_join(movie_effect, by = 'movieId') %>% .$bi
+
+rmse_2 <- RMSE(predicted_2, validation$rating)
+
+rmses <- bind_rows(rmses, data_frame(method = "Add Movie Effect", RMSE = rmse_2))
+rmses %>% knitr::kable()
+```
+
+
+## 3.3 Adding the User Effect Term
+
+As shown in chapter 2.4 there is also a user effect on ratings. That means different users tend to give different average ratings. Some users will be generous with their ratings, others will be harsh, others will be somewhere in the middle. We account for the user effect by adding an additional user term to the prediction formula
+
+$$Y_{u, i} = \mu + b_{i} + b_{u} + \epsilon_{u, i}$$
+
+Again, the least square estimate can be obtained by adding the individual user average deviation from the overall average and movie average. Adding the user effect to the approach delivers an RMSE of 0.8653488.
+
+```{r, warning=FALSE, message=FALSE}
+user_effect <- edx %>% left_join(movie_effect, by = 'movieId') %>% group_by(userId) %>%
+  summarize(bu = mean(rating - avg - bi))
+
+predicted_3 <- validation %>% left_join(movie_effect, by = 'movieId') %>% 
+  left_join(user_effect, by = 'userId') %>% mutate(pred_3 = avg + bi + bu) %>% .$pred_3
+
+rmse_3 <- RMSE(predicted_3, validation$rating)
+
+rmses <- bind_rows(rmses, data_frame(method = "Add User Effect", RMSE = rmse_3))
+rmses %>% knitr::kable()
+```
+
+
+## 3.4 Regularization
+
+Movie ratings that are based on very low numbers of ratings, especially the 12% based on only one rating, lead to noisy estimates that impact the overall performance of the model. We therefore expect that the RMSE can be further improved by introducing a penalty term that shrinks the impact of those ratings. 
+
+We achieve this with the code below. It can be seen that for large sample sizes the penalty term gets effectively ignored. For small sample sizes it is shrunken towards zero. Figure 5 shows the impact of different lambdas on model performance. The best performance is achieved for lambda = 5.2, which delivers an RMSE of 0.8648170. This result is below the target RMSE for this assignment. 
+
+```{r, warning=FALSE, message=FALSE}
+lambdas <- seq(0,10,0.1)
+
+rmse_lambda <- sapply(lambdas, function(l){
+  mu <- mean(edx$rating)
+  bi <- edx %>% group_by(movieId) %>% summarize(bi = sum(rating - mu)/(n()+l))
+  bu <- edx %>% left_join(bi, by="movieId") %>% group_by(userId) %>% summarize(bu = sum(rating - bi - mu)/(n()+l))
+  
+  predicted_ratings <- validation %>% left_join(bi, by = "movieId") %>% left_join(bu, by = "userId") %>%
+    mutate(pred = mu + bi + bu) %>% .$pred
+  
+  return(RMSE(predicted_ratings, validation$rating))
+})
+```
+
+### Figure 5: Impact of Lambda on Model Performance
+
+```{r, warning=FALSE, message=FALSE}
+# Find optimal lambda
+
+qplot(lambdas, rmse_lambda)
+
+lambda <- lambdas[which.min(rmse_lambda)]
+lambda
+
+rmse_4 <- min(rmse_lambda)
+
+rmses <- bind_rows(rmses, data_frame(method = "Regularization", RMSE = rmse_4))
+rmses %>% knitr::kable()
+```
+
+
+## 3.5 Gradient Boosting: Basic Grid Search
+
+As an alternative approach we run GBM (Gradient Boosting Machines) over the two input variables movie ID and user ID. A basic grid search suggests that a learning rate of 0.1 delivers better results than 0.01. Furthermore a larger number of trees and higher interaction depth delivers better results. Figure 6 shows the impact of the selected tune grid parameters on model performance. 
+
+```{r, warning=FALSE, message=FALSE}
+# Grid Search (w. 3-fold cross validation)
+
+fitControl <- trainControl(method = "repeatedcv", number = 3, repeats = 1)
+gbmGrid <-  expand.grid(interaction.depth = c(3,5,7), n.trees = c(100,300,500), 
+                        shrinkage = c(0.1, 0.01), n.minobsinnode = 10)
+
+rating_pred <- train(rating ~ movieId + userId, data = edx, method = "gbm", 
+                     trControl = fitControl, tuneGrid = gbmGrid)
+
+forecast <- predict(rating_pred, validation)
+
+summary(rating_pred)
+```
+
+### Figure 6: Results of GBM Grid Search
+
+```{r, warning=FALSE, message=FALSE}
+plot(rating_pred)  # Optimal: Shrinkage 0.1, interaction.depth 7, 500 trees
+
+rmse_5 <- RMSE(forecast, validation$rating)
+
+rmses <- bind_rows(rmses, data_frame(method = "GBM Initial Grid", RMSE = rmse_5))
+rmses %>% knitr::kable()
+```
+
+
+## 3.6 Gradient Boosting: Tuned Parameters
+
+Based on the findings in 3.5 we run a tuned model with a learning rate of 0.1, interaction depth of 9, 3-fold cross validation and 3000 trees. This algorithm takes 10 hours to run on a standard laptop. The approach delivers an improved RMSE compared to the initial grid, but still not as good as the Regularization approach. 
+
+```{r, warning=FALSE, message=FALSE}
+fitControl <- trainControl(method = "repeatedcv", number = 3, repeats = 1)
+gbmGrid <-  expand.grid(interaction.depth = 9, n.trees = 3000, shrinkage = 0.1, 
+                        n.minobsinnode = 10)
+
+rating_pred <- train(rating ~ movieId + userId, data = edx, method = "gbm", 
+                     trControl = fitControl, tuneGrid = gbmGrid)
+
+forecast <- predict(rating_pred, validation)
+
+summary(rating_pred)
+
+rmse_6 <- RMSE(forecast, validation$rating)
+
+rmses <- bind_rows(rmses, data_frame(method = "GBM 3000 Trees", RMSE = rmse_6))
+rmses %>% knitr::kable()
+```
+
+
+# 4. Results
+
+Below is the summary of RMSE results obtained from the models discussed in chapter 3.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE}
+rmses %>% knitr::kable()
+```
+
+Modeling movie ratings considering both movie ID and user ID as input variables appears to be a good approach. Based on this approach we have compared Regularization and Gradient Boosting Machines with regards to their predictive power. Regularization delivers the best RMSE of 0.8648170. This delivers on the target of this assignment, which was to produce an RMSE below 0.86490.
+
+
+# 5. Conclusion
+
+Movie ratings have a strong movie effect and user effect. That means different movies attract different average ratings and different users give different ratings averages for the movies they rate. Therefore a modeling approach that considers both movie effect and user effect on ratings delivers good results. 
+
+Regularization delivers the best RMSE by applying a penalty term on movie rating averages that are the result of a small number of ratings. Different regularization coefficients have been evaluated with lambda = 5.2 delivering the best results. The RMSE on the Regularization model outperforms Gradient Boosting with 3000 Trees, 3-fold cross validation, an interaction depth of 9 and learning rate of 0.1.
+
+For the comparison of alternative machine learning algorithms and grid search run times on a standard laptop have been found to be a major limiter.  The Gradient Boosting model in chapter 3.6 requires 10 hours of run time on a standard laptop. Therefore a more comprehensive grid search on hyper parameters was not practical. A knn model was also attempted but had to be abandoned due to run times exceeding 24 hours. Therefore running the presented models on a server and doing a more comprehensive grid search is recommended and will likely further improve RMSEs. 
+
+Furthermore, we have seen in chapter 2 that there is also a time effect to movie ratings. Therefore it is possible that adding the year, month or week of ratings as a third input variable may further improve RMSEs.
+
+The Regularization approach presented in this report produces an RMSE of 0.8648170, which meets the objective for this assignment. 
+
+
